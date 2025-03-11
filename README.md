@@ -1,6 +1,6 @@
 # Perplexity Research Crawler
 
-A powerful AI research tool that combines Perplexity API and Firecrawl to generate comprehensive research reports. This script automatically researches any topic, crawls citation sources, and produces beautifully formatted reports.
+An AI research tool that combines Perplexity API and Firecrawl to help facilitate the creation of comprehensive research reports. This script automatically researches any topic, crawls citation sources, and produces nicely formatted markdown documents for each, as well as a single PDF report of the output.
 
 ## Overview
 
