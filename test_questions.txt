@@ -1,0 +1,5 @@
+What is quantum computing?
+How do quantum computers work?
+What are the applications of quantum computing?
+What is quantum supremacy and has it been achieved?
+What are the main challenges in quantum computing? 
