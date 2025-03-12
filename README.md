@@ -91,8 +91,8 @@ PERPLEXITY_API_KEY=your_perplexity_api_key
 FIRECRAWL_API_KEY=your_firecrawl_api_key
 
 # Models
-PERPLEXITY_RESEARCH_MODEL=sonar-medium-online
-PERPLEXITY_CLEANUP_MODEL=mixtral-8x7b-instruct
+PERPLEXITY_RESEARCH_MODEL=sonar-deep-research
+PERPLEXITY_CLEANUP_MODEL=sonar-pro
 
 # API Error Handling
 API_MAX_RETRIES=3
