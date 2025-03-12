@@ -73,6 +73,8 @@ API_MAX_RETRY_DELAY = float(os.getenv("API_MAX_RETRY_DELAY", 30.0))
 # Rate limiting
 RATE_LIMIT_QUESTIONS_PER_WORKER = int(os.getenv("RATE_LIMIT_QUESTIONS_PER_WORKER", 10))
 THREAD_STAGGER_DELAY = float(os.getenv("THREAD_STAGGER_DELAY", 5.0))
+MAX_CITATIONS = int(os.getenv("MAX_CITATIONS", 50))
+CITATION_TIMEOUT = int(os.getenv("CITATION_TIMEOUT", 300))  # Default: 5 minutes
 
 # Thread safety
 print_lock = threading.Lock()
@@ -151,8 +153,9 @@ def research_pipeline(question, master_folder, question_number, total_questions)
         safe_question = re.sub(r'[-\s]+', '_', safe_question).strip('-_')
         safe_question = safe_question[:30] if len(safe_question) > 30 else safe_question
         
-        question_prefix = f"Q{question_number:02d}_"
-        prefix = f"[Q{question_number}]"  # For log messages
+        # Change prefix from Q to A to make files sort to the top
+        question_prefix = f"A{question_number:02d}_"
+        prefix = f"[Q{question_number}]"  # Keep this as Q for log messages for clarity
         
         # Timestamp not needed for individual questions as they're in the master folder
         response_dir = os.path.join(master_folder, "response")
@@ -189,7 +192,9 @@ def research_pipeline(question, master_folder, question_number, total_questions)
         summary_md_path = os.path.join(markdown_dir, f"{question_prefix}research_summary.md")
         with open(summary_md_path, "w", encoding="utf-8") as f:
             f.write(f"# Research Summary: {question}\n\n")
-            f.write(main_content)
+            # Make sure the content is clean of thinking sections again before writing
+            cleaned_content = clean_thinking_sections(main_content)
+            f.write(cleaned_content)
             f.write("\n\n## Citation Links\n\n")
             for i, url in enumerate(citations, 1):
                 f.write(f"{i}. [{url}]({url})\n")
@@ -207,7 +212,9 @@ def research_pipeline(question, master_folder, question_number, total_questions)
         exec_summary_path = os.path.join(markdown_dir, f"{question_prefix}executive_summary.md")
         with open(exec_summary_path, "w", encoding="utf-8") as f:
             f.write(f"# Executive Summary: {question}\n\n")
-            f.write(exec_summary)
+            # Clean the executive summary of any thinking sections before writing
+            cleaned_exec_summary = clean_thinking_sections(exec_summary)
+            f.write(cleaned_exec_summary)
         safe_print(f"{Colors.GREEN}{prefix} Saved executive summary.{Colors.RESET}")
 
         # Create a question metadata file with citations
@@ -261,7 +268,9 @@ def create_master_index(master_folder, questions, results):
         for i, question in enumerate(questions, 1):
             success = results[i-1][0] if i-1 < len(results) else False
             status = "✅" if success else "❌"
-            f.write(f"{i}. {status} [Q{i:02d}: {question[:80]}{'...' if len(question) > 80 else ''}](#q{i:02d})\n")
+            # Clean any thinking sections from the question
+            clean_question = clean_thinking_sections(question)
+            f.write(f"{i}. {status} [Q{i:02d}: {clean_question[:80]}{'...' if len(clean_question) > 80 else ''}](#q{i:02d})\n")
         
         f.write("\n---\n\n")
         
@@ -270,7 +279,9 @@ def create_master_index(master_folder, questions, results):
             f.write(f"## Q{i:02d}\n\n")
             success, research_response, citations = results[i-1] if i-1 < len(results) else (False, None, [])
             
-            f.write(f"**Question**: {question}\n\n")
+            # Clean any thinking sections from the question
+            clean_question = clean_thinking_sections(question)
+            f.write(f"**Question**: {clean_question}\n\n")
             
             if not success:
                 f.write("**Status**: ❌ Processing failed\n\n")
@@ -288,8 +299,8 @@ def create_master_index(master_folder, questions, results):
             else:
                 f.write("**Citations**: None found\n\n")
                 
-            # Links to outputs
-            question_prefix = f"Q{i:02d}_"
+            # Links to outputs - updated to use A prefix instead of Q
+            question_prefix = f"A{i:02d}_"
             f.write("\n**Research Outputs**:\n\n")
             f.write(f"- [Research Summary]({question_prefix}research_summary.md)\n")
             f.write(f"- [Executive Summary]({question_prefix}executive_summary.md)\n")
@@ -373,6 +384,8 @@ This is from the URL: {citation_url}
             # Extract the final text from cleanup
             if cleanup_response.get("choices") and len(cleanup_response["choices"]) > 0:
                 cleaned_content = cleanup_response["choices"][0]["message"].get("content", "")
+                # Ensure we clean any thinking sections from the content
+                cleaned_content = clean_thinking_sections(cleaned_content)
             else:
                 cleaned_content = "Error: Failed to get cleaned content from Perplexity."
         
@@ -382,7 +395,9 @@ This is from the URL: {citation_url}
             f.write(f"# Citation {citation_id}: {citation_url}\n\n")
             f.write(f"## Referenced by\n\n{questions_summary}\n\n")
             f.write("## Content\n\n")
-            f.write(cleaned_content)
+            # Ensure we clean any thinking sections from the content again before writing
+            final_cleaned_content = clean_thinking_sections(cleaned_content)
+            f.write(final_cleaned_content)
         safe_print(f"{Colors.GREEN}{prefix} Saved cleaned Markdown for citation {citation_id}.{Colors.RESET}")
         
         # Create citation metadata
@@ -423,6 +438,7 @@ This is from the URL: {citation_url}
 def extract_and_deduplicate_citations(all_questions_results):
     """
     Phase 2: Extract and deduplicate all citations from research responses.
+    Also ranks citations by frequency of reference.
     
     Args:
         all_questions_results: List of tuples (success_flag, research_response, citations)
@@ -459,14 +475,87 @@ def extract_and_deduplicate_citations(all_questions_results):
     
     return citation_map
 
-def create_citation_index(master_folder, citation_map, citation_results):
+def prioritize_citations(citation_map, max_citations=50):
+    """
+    Prioritize citations based on frequency of reference and return top N.
+    
+    Args:
+        citation_map: Dictionary mapping citations to list of referencing questions
+        max_citations: Maximum number of citations to process
+        
+    Returns:
+        Tuple of (prioritized_citations, skipped_count)
+    """
+    # Sort citations by number of references (descending)
+    sorted_citations = sorted(
+        citation_map.items(), 
+        key=lambda item: len(item[1]), 
+        reverse=True
+    )
+    
+    # Take top N citations
+    prioritized_citations = dict(sorted_citations[:max_citations])
+    skipped_count = len(sorted_citations) - max_citations if len(sorted_citations) > max_citations else 0
+    
+    return prioritized_citations, skipped_count
+
+# Add a new timeout wrapper function
+def with_timeout(func, timeout, *args, **kwargs):
+    """
+    Run a function with a timeout. If the function doesn't complete within
+    the timeout, return an error result.
+    
+    Args:
+        func: The function to call
+        timeout: Timeout in seconds
+        *args: Arguments to pass to the function
+        **kwargs: Keyword arguments to pass to the function
+        
+    Returns:
+        Result of the function or an error result if timeout occurs
+    """
+    import threading
+    import queue
+    
+    result_queue = queue.Queue()
+    
+    def worker():
+        try:
+            result = func(*args, **kwargs)
+            result_queue.put(("success", result))
+        except Exception as e:
+            result_queue.put(("error", str(e)))
+    
+    thread = threading.Thread(target=worker)
+    thread.daemon = True
+    thread.start()
+    
+    try:
+        status, result = result_queue.get(timeout=timeout)
+        if status == "error":
+            raise Exception(result)
+        return result
+    except queue.Empty:
+        # Timeout occurred
+        citation_id = args[3] if len(args) > 3 else "unknown"
+        citation_url = args[0] if args else "unknown"
+        return {
+            "citation_id": citation_id,
+            "url": citation_url,
+            "success": False,
+            "content": f"# Error Processing Citation\n\n**URL**: {citation_url}\n\n**Error details**: Processing timed out after {timeout} seconds\n\n",
+            "error": f"Timeout after {timeout} seconds"
+        }
+
+def create_citation_index(master_folder, citation_map, citation_results, skipped_count=0):
     """
     Create an index of all citations in Markdown format.
     
     Args:
         master_folder: The master folder for output
-        citation_map: Mapping of citations to questions
-        citation_results: Results from processing citations
+        citation_map: Mapping of citations to questions (full map)
+        citation_results: Results from processing citations (prioritized ones)
+        skipped_count: Number of citations that were skipped due to prioritization
     """
     markdown_dir = os.path.join(master_folder, "markdown")
     citation_index_path = os.path.join(markdown_dir, "citation_index.md")
@@ -475,16 +564,23 @@ def create_citation_index(master_folder, citation_map, citation_results):
         f.write("# Citation Index\n\n")
         f.write("This document indexes all unique citations found during research.\n\n")
         
-        # Create a table of contents
-        f.write("## Table of Contents\n\n")
+        if skipped_count > 0:
+            f.write(f"**Note**: {skipped_count} less referenced citations were not processed to optimize API usage and processing time.\n\n")
+        
+        # Create sections
+        f.write("## Processed Citations\n\n")
+        f.write("These citations were processed and have content available:\n\n")
+        
+        # Create a table of contents for processed citations
         for i, citation_result in enumerate(citation_results, 1):
             citation_url = citation_result["url"]
             success_mark = "✅" if citation_result["success"] else "❌"
-            f.write(f"{i}. {success_mark} [Citation {i}: {citation_url[:60]}...](#citation-{i})\n")
+            ref_count = len(citation_map.get(citation_url, []))
+            f.write(f"{i}. {success_mark} [Citation {i}: {citation_url[:60]}...](#citation-{i}) (Referenced by {ref_count} questions)\n")
         
         f.write("\n---\n\n")
         
-        # Add detailed entries for each citation
+        # Add detailed entries for each processed citation
         for i, citation_result in enumerate(citation_results, 1):
             citation_url = citation_result["url"]
             success_status = "Successfully processed" if citation_result["success"] else "Processing failed"
@@ -495,14 +591,133 @@ def create_citation_index(master_folder, citation_map, citation_results):
             
             # List referencing questions
             questions = citation_map.get(citation_url, [])
-            f.write("**Referenced by**:\n\n")
+            f.write(f"**Referenced by {len(questions)} questions**:\n\n")
             for q in questions:
-                f.write(f"- Q{q['question_number']:02d}: {q['question']}\n")
+                # Clean any thinking sections from the question
+                clean_question = clean_thinking_sections(q['question'])
+                f.write(f"- Q{q['question_number']:02d}: {clean_question}\n")
             
             f.write("\n---\n\n")
+        
+        # Create a section for skipped citations if any
+        if skipped_count > 0:
+            f.write("## Skipped Citations\n\n")
+            f.write("These citations were found but not processed due to prioritization:\n\n")
+            
+            # Get URLs of processed citations
+            processed_urls = [result["url"] for result in citation_results]
+            
+            # Find skipped citations
+            skipped_citation_items = [
+                (url, refs) for url, refs in citation_map.items() 
+                if url not in processed_urls
+            ]
+            
+            # Sort by reference count (descending)
+            skipped_citation_items.sort(key=lambda x: len(x[1]), reverse=True)
+            
+            # List them
+            for i, (url, refs) in enumerate(skipped_citation_items, 1):
+                ref_count = len(refs)
+                f.write(f"{i}. [{url[:60]}...]({url}) (Referenced by {ref_count} questions)\n")
     
-    safe_print(f"{Colors.GREEN}Created citation index with {len(citation_results)} citations.{Colors.RESET}")
+    safe_print(f"{Colors.GREEN}Created citation index with all {len(citation_map)} citations.{Colors.RESET}")
     return citation_index_path
+
+def consolidate_summary_files(master_folder, pattern, output_filename, title):
+    """
+    Consolidate all files matching a pattern in the markdown directory into a single file.
+    
+    Args:
+        master_folder: The master folder for the research project
+        pattern: Regex pattern to match filenames (e.g., "executive_summary")
+        output_filename: Name of the output file
+        title: Title for the consolidated file
+    
+    Returns:
+        Path to the consolidated file
+    """
+    markdown_dir = os.path.join(master_folder, "markdown")
+    summaries_dir = os.path.join(master_folder, "summaries")
+    os.makedirs(summaries_dir, exist_ok=True)
+    
+    # Find all files matching the pattern
+    summary_files = []
+    for filename in os.listdir(markdown_dir):
+        if pattern in filename.lower() and filename.endswith(".md"):
+            summary_files.append(filename)
+    
+    # Sort files by question number (assuming format like A01_, A02_, etc.)
+    summary_files.sort(key=lambda x: int(re.search(r'A(\d+)_', x).group(1)) if re.search(r'A(\d+)_', x) else 999)
+    
+    # Create a consolidated markdown file
+    output_file = os.path.join(summaries_dir, output_filename)
+    
+    # Write a header for the consolidated file
+    with open(output_file, 'w', encoding='utf-8') as outfile:
+        outfile.write(f"# {title}\n\n")
+        outfile.write(f"This document contains all {pattern} files from the research project.\n\n")
+        outfile.write("---\n\n")
+        
+        # Read and append each summary file
+        for i, filename in enumerate(summary_files, 1):
+            file_path = os.path.join(markdown_dir, filename)
+            
+            # Extract question number if available
+            question_num = re.search(r'A(\d+)_', filename)
+            question_label = f"Question {question_num.group(1)}" if question_num else f"Summary {i}"
+            
+            # Add a divider between summaries (except before the first one)
+            if i > 1:
+                outfile.write("\n\n---\n\n")
+            
+            outfile.write(f"## {question_label}\n\n")
+            
+            # Read and append the file content, skipping the original title
+            with open(file_path, 'r', encoding='utf-8') as infile:
+                content = infile.read()
+                
+                # Skip the original title (assumes first line is a markdown title)
+                lines = content.split('\n')
+                if lines and lines[0].startswith('# '):
+                    content = '\n'.join(lines[1:])
+                
+                # Clean any thinking sections from the content
+                content = clean_thinking_sections(content)
+                
+                outfile.write(content.strip())
+    
+    safe_print(f"{Colors.GREEN}Consolidated {len(summary_files)} {pattern} files into: {output_file}{Colors.RESET}")
+    return output_file
+
+def move_file(source_path, dest_dir):
+    """
+    Move a file from source path to destination directory.
+    
+    Args:
+        source_path: Path to the source file
+        dest_dir: Destination directory
+        
+    Returns:
+        Path to the moved file
+    """
+    os.makedirs(dest_dir, exist_ok=True)
+    filename = os.path.basename(source_path)
+    dest_path = os.path.join(dest_dir, filename)
+    
+    # Read the original file
+    with open(source_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    # Write to the new location
+    with open(dest_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+    
+    # If write was successful, delete the original file (optional)
+    # os.remove(source_path)
+    
+    safe_print(f"{Colors.GREEN}Moved {filename} to {dest_dir}{Colors.RESET}")
+    return dest_path
 
 def generate_research_questions(topic, perspective, depth):
     """
@@ -587,6 +802,7 @@ def main():
     parser.add_argument("--output", "-o", default="./research_output", help="Output directory (default: ./research_output)")
     parser.add_argument("--max-workers", "-w", type=int, default=None, help="Maximum number of worker threads (default: automatic based on number of questions)")
     parser.add_argument("--stagger-delay", "-s", type=float, default=None, help="Seconds to wait before starting each new thread (default: from .env)")
+    parser.add_argument("--max-citations", "-c", type=int, default=MAX_CITATIONS, help=f"Maximum number of citations to process (default: {MAX_CITATIONS} from .env)")
     args = parser.parse_args()
     
     # Determine which mode we're operating in
@@ -654,6 +870,17 @@ def main():
             except ValueError:
                 safe_print(f"{Colors.RED}Invalid number. Using automatic calculation.{Colors.RESET}")
         
+        # Prompt for max citations
+        citations_input = input(f"{Colors.CYAN}Enter maximum number of citations to process (or press Enter for 50): {Colors.RESET}").strip()
+        if citations_input:
+            try:
+                args.max_citations = int(citations_input)
+                if args.max_citations < 1:
+                    safe_print(f"{Colors.RED}Error: Max citations must be at least 1. Using default of 50.{Colors.RESET}")
+                    args.max_citations = 50
+            except ValueError:
+                safe_print(f"{Colors.RED}Invalid number. Using default of 50.{Colors.RESET}")
+        
         # Generate questions using the provided inputs
         safe_print(f"{Colors.BOLD}{Colors.BLUE}Generating questions for topic: {topic}{Colors.RESET}")
         questions = generate_research_questions(topic, perspective, depth)
@@ -704,6 +931,7 @@ def main():
     os.makedirs(master_folder, exist_ok=True)
     os.makedirs(os.path.join(master_folder, "response"), exist_ok=True)
     os.makedirs(os.path.join(master_folder, "markdown"), exist_ok=True)
+    os.makedirs(os.path.join(master_folder, "summaries"), exist_ok=True)  # Added new summaries directory
     
     # Create a README for the project
     if args.topic:
@@ -715,7 +943,8 @@ def main():
             f.write(f"**Perspective**: {args.perspective}\n\n")
             f.write("## Folder Structure\n\n")
             f.write("- `markdown/`: Formatted markdown files for each research question\n")
-            f.write("- `response/`: Raw API responses\n\n")
+            f.write("- `response/`: Raw API responses\n")
+            f.write("- `summaries/`: Consolidated files and indexes\n\n")
             f.write("## Research Questions\n\n")
             for i, q in enumerate(questions, 1):
                 f.write(f"{i}. {q}\n")
@@ -723,6 +952,7 @@ def main():
     safe_print(f"{Colors.BOLD}{Colors.GREEN}Research orchestrator started at {time.strftime('%Y-%m-%d %H:%M:%S')}{Colors.RESET}")
     safe_print(f"{Colors.MAGENTA}Processing {len(questions)} questions with a maximum of {max_workers} worker threads{Colors.RESET}")
     safe_print(f"{Colors.MAGENTA}Thread stagger delay: {THREAD_STAGGER_DELAY} seconds{Colors.RESET}")
+    safe_print(f"{Colors.MAGENTA}Max citations to process: {args.max_citations} (prioritizing most referenced ones){Colors.RESET}")
     safe_print(f"{Colors.MAGENTA}Output directory: {master_folder}{Colors.RESET}")
     
     ########## PHASE 1: Process all questions ##########
@@ -761,45 +991,66 @@ def main():
     safe_print(f"{Colors.GREEN}Found {unique_citation_count} unique citations across {successful_questions} questions.{Colors.RESET}")
     safe_print(f"{Colors.GREEN}Total citation references: {total_citation_references} (avg {total_citation_references/max(1, successful_questions):.1f} per question){Colors.RESET}")
     
-    if unique_citation_count == 0:
+    # Prioritize citations - limit to the top N most referenced ones
+    prioritized_citation_map, skipped_count = prioritize_citations(citation_map, args.max_citations)
+    
+    if skipped_count > 0:
+        safe_print(f"{Colors.YELLOW}Limiting to top {args.max_citations} most referenced citations. Skipping {skipped_count} less referenced citations.{Colors.RESET}")
+    
+    if len(prioritized_citation_map) == 0:
         safe_print(f"{Colors.YELLOW}No citations found. Skipping citation processing phase.{Colors.RESET}")
         # Create the master index even if there are no citations
-        create_master_index(master_folder, questions, all_question_results)
+        master_index_path = create_master_index(master_folder, questions, all_question_results)
+        
+        # Consolidate summary files and move master index
+        safe_print(f"\n{Colors.BOLD}{Colors.CYAN}======== PHASE 4: CONSOLIDATING SUMMARIES ========{Colors.RESET}")
+        consolidate_summary_files(master_folder, "executive_summary", "consolidated_executive_summaries.md", "Consolidated Executive Summaries")
+        consolidate_summary_files(master_folder, "research_summary", "consolidated_research_summaries.md", "Consolidated Research Summaries")
+        move_file(master_index_path, os.path.join(master_folder, "summaries"))
         return
         
     ########## PHASE 3: Process each unique citation ##########
     safe_print(f"\n{Colors.BOLD}{Colors.CYAN}======== PHASE 3: PROCESSING UNIQUE CITATIONS ========{Colors.RESET}")
+    safe_print(f"{Colors.CYAN}Processing {len(prioritized_citation_map)} prioritized citations...{Colors.RESET}")
     
     # Process citations in parallel
     citation_results = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Create a future for each unique citation
         futures = {}
-        for i, (citation_url, question_context) in enumerate(citation_map.items(), 1):
+        for i, (citation_url, question_context) in enumerate(prioritized_citation_map.items(), 1):
             # Stagger the thread starts to avoid API rate limits
             if i > 1 and THREAD_STAGGER_DELAY > 0:
                 time.sleep(THREAD_STAGGER_DELAY)
                 
+            # For log message, show citation rank by reference count
+            ref_count = len(question_context)
+            
+            # Use the timeout wrapper with a configurable timeout
+            # This ensures no single citation can hang the entire process
             future = executor.submit(
+                with_timeout,
                 process_citation, 
-                citation_url, 
-                question_context, 
-                master_folder, 
-                i, 
-                unique_citation_count
+                citation_url,
+                question_context,
+                master_folder,
+                i,
+                len(prioritized_citation_map),
+                f"[Refs: {ref_count}]",
+                CITATION_TIMEOUT  # Use timeout from environment
             )
-            futures[future] = (i, citation_url)
+            futures[future] = (i, citation_url, ref_count)
             
         # Collect results as they complete
         for future in as_completed(futures):
-            i, citation_url = futures[future]
+            i, citation_url, ref_count = futures[future]
             try:
                 result = future.result()
                 citation_results.append(result)
                 success_indicator = Colors.GREEN + "✓" if result["success"] else Colors.RED + "✗"
-                safe_print(f"{success_indicator} Citation {i}/{unique_citation_count} complete: {citation_url[:60]}...{Colors.RESET}")
+                safe_print(f"{success_indicator} Citation {i}/{len(prioritized_citation_map)} complete: {citation_url[:60]}... (Referenced by {ref_count} questions){Colors.RESET}")
             except Exception as e:
-                safe_print(f"{Colors.RED}Error processing citation {i}/{unique_citation_count}: {str(e)}{Colors.RESET}")
+                safe_print(f"{Colors.RED}Error processing citation {i}/{len(prioritized_citation_map)}: {str(e)}{Colors.RESET}")
                 citation_results.append({
                     "citation_id": i,
                     "url": citation_url,
@@ -810,18 +1061,46 @@ def main():
     
     # Count successful citations
     successful_citations = sum(1 for result in citation_results if result["success"])
-    safe_print(f"\n{Colors.BOLD}{Colors.GREEN}Phase 3 complete: Successfully processed {successful_citations} out of {unique_citation_count} citations.{Colors.RESET}")
+    safe_print(f"\n{Colors.BOLD}{Colors.GREEN}Phase 3 complete: Successfully processed {successful_citations} out of {len(prioritized_citation_map)} citations.{Colors.RESET}")
     
-    # Create indexes
-    create_master_index(master_folder, questions, all_question_results)
-    create_citation_index(master_folder, citation_map, citation_results)
+    # Create indexes - pass the original citation_map to create_citation_index
+    # so it can show all citations (including skipped ones)
+    master_index_path = create_master_index(master_folder, questions, all_question_results)
+    citation_index_path = create_citation_index(master_folder, citation_map, citation_results, skipped_count)
+    
+    ########## PHASE 4: Consolidate summaries ##########
+    safe_print(f"\n{Colors.BOLD}{Colors.CYAN}======== PHASE 4: CONSOLIDATING SUMMARIES ========{Colors.RESET}")
+    
+    # Consolidate executive summaries and research summaries
+    exec_summary_path = consolidate_summary_files(master_folder, "executive_summary", "consolidated_executive_summaries.md", "Consolidated Executive Summaries")
+    research_summary_path = consolidate_summary_files(master_folder, "research_summary", "consolidated_research_summaries.md", "Consolidated Research Summaries")
+    
+    # Move master index and citation index to summaries folder
+    move_file(master_index_path, os.path.join(master_folder, "summaries"))
+    move_file(citation_index_path, os.path.join(master_folder, "summaries"))
+    
+    # Update README to mention consolidated files
+    if args.topic and os.path.exists(readme_path):
+        with open(readme_path, "a", encoding="utf-8") as f:
+            f.write("\n## Consolidated Files\n\n")
+            f.write("For convenience, the following consolidated files are available in the `summaries/` directory:\n\n")
+            f.write("- `consolidated_executive_summaries.md`: All executive summaries in one file\n")
+            f.write("- `consolidated_research_summaries.md`: All research summaries in one file\n")
+            f.write("- `master_index.md`: Index of all questions and their research outputs\n")
+            f.write("- `citation_index.md`: Index of all citations and their references\n")
     
     # Output summary
     safe_print(f"\n{Colors.BOLD}{Colors.GREEN}Research complete at {time.strftime('%Y-%m-%d %H:%M:%S')}{Colors.RESET}")
     safe_print(f"{Colors.CYAN}Summary:{Colors.RESET}")
     safe_print(f"{Colors.CYAN}- Questions: {successful_questions}/{len(questions)} successfully processed{Colors.RESET}")
-    safe_print(f"{Colors.CYAN}- Citations: {successful_citations}/{unique_citation_count} successfully processed{Colors.RESET}")
+    safe_print(f"{Colors.CYAN}- Citations: Found {unique_citation_count} unique citations{Colors.RESET}")
+    if skipped_count > 0:
+        safe_print(f"{Colors.CYAN}- Citation Processing: {successful_citations}/{len(prioritized_citation_map)} prioritized citations processed, {skipped_count} less relevant citations skipped{Colors.RESET}")
+    else:
+        safe_print(f"{Colors.CYAN}- Citation Processing: {successful_citations}/{len(prioritized_citation_map)} citations processed{Colors.RESET}")
+    safe_print(f"{Colors.CYAN}- Consolidated Files: Executive summaries, research summaries{Colors.RESET}")
     safe_print(f"{Colors.CYAN}- Output directory: {master_folder}{Colors.RESET}")
+    safe_print(f"{Colors.CYAN}- Summaries directory: {os.path.join(master_folder, 'summaries')}{Colors.RESET}")
 
 if __name__ == "__main__":
     main() 

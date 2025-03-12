@@ -11,7 +11,9 @@ This toolkit enables:
 - **Multi-question research** from a single topic
 - **Parallel processing** with rate limit protection
 - **Citation deduplication** for efficient processing
-- **Comprehensive output** with markdown files and research indexes
+- **Citation prioritization** to focus on the most relevant sources
+- **Automatic timeout protection** to handle problematic URLs
+- **Comprehensive output** with consolidated summaries and research indexes
 
 ## Quick Start
 
@@ -62,6 +64,9 @@ python research_orchestrator.py --output ./my_research --topic "AI in Healthcare
 
 # Control worker threads and timing
 python research_orchestrator.py --max-workers 3 --stagger-delay 10 --topic "Sustainable Energy"
+
+# Limit citation processing
+python research_orchestrator.py --max-citations 30 --topic "Quantum Computing"
 ```
 
 ## Key Features
@@ -76,11 +81,15 @@ python research_orchestrator.py --max-workers 3 --stagger-delay 10 --topic "Sust
 - **Smart Retry Logic**: Implements exponential backoff with jitter for rate-limited API calls
 - **Staggered Thread Starts**: Configurable delay between starting each worker thread
 - **Citation Deduplication**: Process each citation URL only once, even if referenced by multiple questions
+- **Citation Prioritization**: Focus on the most frequently referenced citations first
+- **Timeout Protection**: Automatically skip citations that take too long to process
 
 ### User Experience
 - **Color-coded Output**: Clear visual feedback on processing status
 - **Progress Tracking**: Individual progress for each question and citation
 - **Comprehensive Indexing**: Master index of questions and citation index for navigation
+- **Consolidated Summaries**: Automatically combines executive and research summaries
+- **A-prefix Naming**: Improved file naming convention for better sorting
 
 ## Configuration
 
@@ -96,18 +105,22 @@ PERPLEXITY_CLEANUP_MODEL=sonar-pro
 
 # API Error Handling
 API_MAX_RETRIES=3
-API_INITIAL_RETRY_DELAY=2.0
-API_MAX_RETRY_DELAY=30.0
+API_INITIAL_RETRY_DELAY=5.0
+API_MAX_RETRY_DELAY=60.0
 
-# Rate Limiting
-RATE_LIMIT_QUESTIONS_PER_WORKER=10
+# Performance Tuning
+RATE_LIMIT_QUESTIONS_PER_WORKER=7
 THREAD_STAGGER_DELAY=5.0
+MAX_CITATIONS=50
+CITATION_TIMEOUT=300
 ```
 
-### Rate Limit Tuning
+### Performance Tuning
 - `RATE_LIMIT_QUESTIONS_PER_WORKER`: Controls worker thread allocation (higher value = fewer workers)
 - `THREAD_STAGGER_DELAY`: Sets delay between thread starts in seconds
 - `API_MAX_RETRIES`: Maximum number of retry attempts for rate-limited API calls
+- `MAX_CITATIONS`: Maximum number of citations to process (prioritizes by frequency)
+- `CITATION_TIMEOUT`: Maximum time in seconds to wait for a citation to process
 
 ## Project Structure
 - `perplexityresearch.py`: Original script with single-question research
@@ -117,8 +130,11 @@ THREAD_STAGGER_DELAY=5.0
   - `[Topic]_[timestamp]/`: Master folder for a research project
     - `markdown/`: Formatted markdown files
     - `response/`: Raw API responses
-    - `master_index.md`: Index of all questions
-    - `citation_index.md`: Index of all citations
+    - `summaries/`: Consolidated output files
+      - `consolidated_executive_summaries.md`: All executive summaries combined
+      - `consolidated_research_summaries.md`: All research summaries combined
+      - `master_index.md`: Index of all questions
+      - `citation_index.md`: Index of all citations
     - `README.md`: Overview of the research project
 
 ## How It Works
@@ -138,14 +154,26 @@ For each question:
 ### Citation Processing
 After all questions are processed:
 1. Extracts and deduplicates citation URLs across all questions
-2. Processes each unique citation once with Firecrawl
-3. Cleans and formats citation content with Perplexity
-4. Creates cross-referenced indexes of questions and citations
+2. Prioritizes citations based on their frequency of reference
+3. Processes top N citations (default: 50) with Firecrawl
+4. Implements timeout protection to handle problematic URLs
+5. Cleans and formats citation content with Perplexity
+6. Creates cross-referenced indexes of questions and citations
+
+## Recent Enhancements
+
+1. **Interactive Mode**: Run without arguments and follow prompts
+2. **Citation Prioritization**: Focus on the most frequently referenced citations
+3. **Consolidated Summary Files**: Automatically combine all summaries
+4. **Improved File Naming**: Changed naming convention from Q-prefix to A-prefix for better sorting
+5. **Timeout Protection**: Automatically skip citations that take too long to process
+6. **Summaries Directory**: Organized consolidated files in a dedicated folder
 
 ## Performance Benefits
 - **Time savings**: 30-50% overall time reduction for multi-question research
 - **API efficiency**: 40-60% reduction in API calls for citation processing
 - **Rate limit protection**: Three layers of protection (worker allocation, retry logic, staggered starts)
+- **Robust handling**: Automatic timeout protection prevents hanging on problematic URLs
 
 ## Limitations
 - Social media sites may require special Firecrawl access
