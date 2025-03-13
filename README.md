@@ -14,17 +14,18 @@ This toolkit enables:
 - **Citation prioritization** to focus on the most relevant sources
 - **Automatic timeout protection** to handle problematic URLs
 - **Comprehensive output** with consolidated summaries and research indexes
+- **OpenAI integration** for semantic search across research outputs
 
 ## Quick Start
 
 1. **Install dependencies**:
    ```
-   pip install reportlab requests python-dotenv firecrawl
+   pip install reportlab requests python-dotenv firecrawl openai
    ```
 
 2. **Set up your API keys**:
    - Create a `.env` file based on the provided `.env.example`
-   - Add your Perplexity and Firecrawl API keys
+   - Add your Perplexity, Firecrawl, and OpenAI API keys
 
 3. **Run the research orchestrator in interactive mode**:
    ```
@@ -60,10 +61,10 @@ python research_orchestrator.py --questions questions.txt
 ### Common Options for All Modes
 ```bash
 # Custom output directory
-python research_orchestrator.py --output ./my_research --topic "AI in Healthcare"
+python research_orchestrator.py --output-dir ./my_research --topic "AI in Healthcare"
 
-# Control worker threads and timing
-python research_orchestrator.py --max-workers 3 --stagger-delay 10 --topic "Sustainable Energy"
+# Skip OpenAI file uploads
+python research_orchestrator.py --skip-openai-upload --topic "Sustainable Energy"
 
 # Limit citation processing
 python research_orchestrator.py --max-citations 30 --topic "Quantum Computing"
@@ -71,10 +72,12 @@ python research_orchestrator.py --max-citations 30 --topic "Quantum Computing"
 
 ## Key Features
 
-### Three-Phase Processing Workflow
+### Five-Phase Processing Workflow
 1. **Phase 1**: Process all research questions to get initial responses
 2. **Phase 2**: Extract and deduplicate citations across all questions
 3. **Phase 3**: Process each unique citation exactly once
+4. **Phase 4**: Consolidate summaries and create indexes
+5. **Phase 5**: Upload research files to OpenAI and create a vector store
 
 ### Performance Optimizations
 - **Parallel Processing**: Uses ThreadPoolExecutor to run multiple research questions simultaneously
@@ -98,6 +101,7 @@ python research_orchestrator.py --max-citations 30 --topic "Quantum Computing"
 # API Keys
 PERPLEXITY_API_KEY=your_perplexity_api_key
 FIRECRAWL_API_KEY=your_firecrawl_api_key
+OPENAI_API_KEY=your_openai_api_key
 
 # Models
 PERPLEXITY_RESEARCH_MODEL=sonar-deep-research
@@ -126,16 +130,18 @@ CITATION_TIMEOUT=300
 - `perplexityresearch.py`: Original script with single-question research
 - `research_orchestrator.py`: Enhanced script with multi-question orchestration
 - `.env`: Contains API keys and configuration values
+- `research_projects.json`: Central tracking file for all research projects and OpenAI uploads
 - Output structure:
   - `[Topic]_[timestamp]/`: Master folder for a research project
     - `markdown/`: Formatted markdown files
     - `response/`: Raw API responses
     - `summaries/`: Consolidated output files
-      - `consolidated_executive_summaries.md`: All executive summaries combined
-      - `consolidated_research_summaries.md`: All research summaries combined
+      - `consolidated_summaries.md`: All research summaries combined
+      - `consolidated_executive_summaries.md`: Executive summary version
       - `master_index.md`: Index of all questions
       - `citation_index.md`: Index of all citations
     - `README.md`: Overview of the research project
+    - `openai_upload_info.json`: Details about files uploaded to OpenAI
 
 ## How It Works
 
@@ -160,14 +166,23 @@ After all questions are processed:
 5. Cleans and formats citation content with Perplexity
 6. Creates cross-referenced indexes of questions and citations
 
+### OpenAI Integration
+After consolidation:
+1. Uploads markdown files and summaries to OpenAI's file storage
+2. Creates a vector store for semantic search capabilities
+3. Adds uploaded files to the vector store
+4. Tracks project details in a central JSON file
+
 ## Recent Enhancements
 
-1. **Interactive Mode**: Run without arguments and follow prompts
-2. **Citation Prioritization**: Focus on the most frequently referenced citations
-3. **Consolidated Summary Files**: Automatically combine all summaries
-4. **Improved File Naming**: Changed naming convention from Q-prefix to A-prefix for better sorting
-5. **Timeout Protection**: Automatically skip citations that take too long to process
-6. **Summaries Directory**: Organized consolidated files in a dedicated folder
+1. **OpenAI Integration**: Upload research files to OpenAI and create vector stores for semantic search
+2. **Research Project Tracking**: Central JSON tracking of all research projects
+2. **Interactive Mode**: Run without arguments and follow prompts
+3. **Citation Prioritization**: Focus on the most frequently referenced citations
+4. **Consolidated Summary Files**: Automatically combine all summaries
+5. **Improved File Naming**: Changed naming convention from Q-prefix to A-prefix for better sorting
+6. **Timeout Protection**: Automatically skip citations that take too long to process
+7. **Summaries Directory**: Organized consolidated files in a dedicated folder
 
 ## Performance Benefits
 - **Time savings**: 30-50% overall time reduction for multi-question research

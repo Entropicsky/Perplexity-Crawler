@@ -21,6 +21,13 @@ Key Features:
 - Rate limit protection with smart retry logic
 - Citation deduplication across questions
 - Comprehensive markdown outputs and indexes
+- OpenAI file search integration (optional)
+
+OpenAI Integration:
+- Automatically uploads research outputs to OpenAI
+- Creates vector stores for semantic search
+- Tracks research projects in a JSON database
+- Enables future applications to search and interact with research
 
 Usage (Topic Mode):
     python research_orchestrator.py --topic "Kahua, the Construction Software Management Company" --perspective "Chief Product Officer" --depth 5
@@ -30,6 +37,10 @@ Usage (Direct Question Mode):
     
 Usage (Questions from File):
     python research_orchestrator.py --questions questions.txt
+
+OpenAI Integration Options:
+    python research_orchestrator.py --topic "AI Ethics" --openai-integration enable
+    python research_orchestrator.py --questions "What is climate change?" --openai-integration disable
 
 Run with --help for more options.
 """
@@ -43,8 +54,17 @@ import traceback
 import argparse
 import threading
 import random
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
+
+# Try importing OpenAI for file search functionality
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+    print("Warning: OpenAI package not available. File search integration will be disabled.")
 
 # Import functionality from perplexityresearch.py
 from perplexityresearch import (
@@ -60,6 +80,7 @@ load_dotenv()
 # API Keys
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # Models
 PERPLEXITY_RESEARCH_MODEL = os.getenv("PERPLEXITY_RESEARCH_MODEL", "sonar-medium-online")
@@ -75,6 +96,14 @@ RATE_LIMIT_QUESTIONS_PER_WORKER = int(os.getenv("RATE_LIMIT_QUESTIONS_PER_WORKER
 THREAD_STAGGER_DELAY = float(os.getenv("THREAD_STAGGER_DELAY", 5.0))
 MAX_CITATIONS = int(os.getenv("MAX_CITATIONS", 50))
 CITATION_TIMEOUT = int(os.getenv("CITATION_TIMEOUT", 300))  # Default: 5 minutes
+
+# Project tracking
+RESEARCH_PROJECTS_FILE = os.getenv("RESEARCH_PROJECTS_FILE", "research_projects.json")
+ENABLE_OPENAI_INTEGRATION = os.getenv("ENABLE_OPENAI_INTEGRATION", "true").lower() in ["true", "yes", "1"]
+OPENAI_FILE_UPLOAD_TIMEOUT = int(os.getenv("OPENAI_FILE_UPLOAD_TIMEOUT", "60"))
+OPENAI_VECTORSTORE_CREATION_TIMEOUT = int(os.getenv("OPENAI_VECTORSTORE_CREATION_TIMEOUT", "60"))
+OPENAI_PROCESSING_MAX_CHECKS = int(os.getenv("OPENAI_PROCESSING_MAX_CHECKS", "20"))
+OPENAI_PROCESSING_CHECK_INTERVAL = int(os.getenv("OPENAI_PROCESSING_CHECK_INTERVAL", "10"))
 
 # Thread safety
 print_lock = threading.Lock()
@@ -138,12 +167,21 @@ def with_retry(func, *args, prefix="", **kwargs):
             # Increase delay for next retry (exponential backoff with jitter)
             delay = min(delay * 2 * (0.5 + random.random()), API_MAX_RETRY_DELAY)
 
-def research_pipeline(question, master_folder, question_number, total_questions):
+def research_pipeline(question, master_folder, question_number, total_questions, topic=None, perspective=None):
     """
     Phase 1 of the research process: Get initial research response for a question.
     Modified to stop after getting the research response - does not process citations.
     
-    Returns a tuple of (success_flag, research_response, citations)
+    Args:
+        question: The research question to process
+        master_folder: Path to the master folder for output
+        question_number: The question number (for logging and file names)
+        total_questions: Total number of questions (for progress reporting)
+        topic: Optional overall research topic for context
+        perspective: Optional professional perspective for context
+    
+    Returns:
+        A tuple of (success_flag, research_response, citations)
     """
     safe_print(f"\n{Colors.BOLD}{Colors.MAGENTA}[{question_number}/{total_questions}] Researching: '{question}'{Colors.RESET}")
     
@@ -163,11 +201,26 @@ def research_pipeline(question, master_folder, question_number, total_questions)
         
         # STEP 1: Call Perplexity with 'research' model for the initial research
         safe_print(f"{Colors.CYAN}{prefix} Starting research...{Colors.RESET}")
+        
+        # Create enhanced prompt with context if topic is provided
+        if topic:
+            context_prompt = f"""
+Research Question: {question}
+
+CONTEXT:
+- Overall Research Topic: {topic}
+- Professional Perspective: {perspective or "Researcher"}
+
+Please perform comprehensive, detailed research on the question above, considering the overall research topic and professional perspective provided in the context. Your answer should be thorough, well-structured, and directly relevant to both the specific question and the broader research goals.
+"""
+        else:
+            context_prompt = question
+            
         research_response = with_retry(
             query_perplexity,
-            prompt=question,
+            prompt=context_prompt,
             model=PERPLEXITY_RESEARCH_MODEL,
-            system_prompt="Perform thorough research on the user's query.",
+            system_prompt="You are a professional researcher providing comprehensive, accurate information. Focus on delivering a thorough analysis that considers both the specific question and its context within the broader research topic.",
             is_research=True,
             prefix=prefix
         )
@@ -208,8 +261,9 @@ def research_pipeline(question, master_folder, question_number, total_questions)
             prefix=prefix
         )
         
-        # Save the executive summary separately
-        exec_summary_path = os.path.join(markdown_dir, f"{question_prefix}executive_summary.md")
+        # Save the executive summary separately with new naming convention
+        exec_summary_prefix = f"ES{question_number}_"
+        exec_summary_path = os.path.join(markdown_dir, f"{exec_summary_prefix}executive_summary.md")
         with open(exec_summary_path, "w", encoding="utf-8") as f:
             f.write(f"# Executive Summary: {question}\n\n")
             # Clean the executive summary of any thinking sections before writing
@@ -517,6 +571,31 @@ def with_timeout(func, timeout, *args, **kwargs):
     import threading
     import queue
     
+    # First, verify citation_url is valid if we're processing a citation
+    if func == process_citation and args:
+        citation_url = args[0]
+        citation_id = args[3] if len(args) > 3 else "unknown"
+        
+        # If citation_url is not a string, return an error
+        if not isinstance(citation_url, str):
+            return {
+                "citation_id": citation_id,
+                "url": str(citation_url),  # Convert to string for display
+                "success": False,
+                "content": f"# Error Processing Citation\n\n**Error details**: Invalid citation URL type: {type(citation_url).__name__}\n\n",
+                "error": f"Invalid citation URL type: {type(citation_url).__name__}"
+            }
+        
+        # Basic URL validation
+        if not citation_url.startswith(('http://', 'https://')):
+            return {
+                "citation_id": citation_id,
+                "url": citation_url,
+                "success": False,
+                "content": f"# Error Processing Citation\n\n**Error details**: Invalid URL format: {citation_url}\n\n",
+                "error": f"Invalid URL format: {citation_url}"
+            }
+    
     result_queue = queue.Queue()
     
     def worker():
@@ -647,8 +726,22 @@ def consolidate_summary_files(master_folder, pattern, output_filename, title):
         if pattern in filename.lower() and filename.endswith(".md"):
             summary_files.append(filename)
     
-    # Sort files by question number (assuming format like A01_, A02_, etc.)
-    summary_files.sort(key=lambda x: int(re.search(r'A(\d+)_', x).group(1)) if re.search(r'A(\d+)_', x) else 999)
+    # Sort files by question number (handling both A01_ and ES1_ formats)
+    def extract_question_number(filename):
+        # Try to match ES{number}_ format first (for executive summaries)
+        es_match = re.search(r'ES(\d+)_', filename)
+        if es_match:
+            return int(es_match.group(1))
+        
+        # Try to match A{number}_ format next (for research summaries)
+        a_match = re.search(r'A(\d+)_', filename)
+        if a_match:
+            return int(a_match.group(1))
+            
+        # If neither pattern matches, put at the end
+        return 999
+    
+    summary_files.sort(key=extract_question_number)
     
     # Create a consolidated markdown file
     output_file = os.path.join(summaries_dir, output_filename)
@@ -663,9 +756,17 @@ def consolidate_summary_files(master_folder, pattern, output_filename, title):
         for i, filename in enumerate(summary_files, 1):
             file_path = os.path.join(markdown_dir, filename)
             
-            # Extract question number if available
-            question_num = re.search(r'A(\d+)_', filename)
-            question_label = f"Question {question_num.group(1)}" if question_num else f"Summary {i}"
+            # Extract question number if available (handle both formats)
+            question_num = None
+            es_match = re.search(r'ES(\d+)_', filename)
+            if es_match:
+                question_num = es_match.group(1)
+            else:
+                a_match = re.search(r'A(\d+)_', filename)
+                if a_match:
+                    question_num = a_match.group(1)
+                    
+            question_label = f"Question {question_num}" if question_num else f"Summary {i}"
             
             # Add a divider between summaries (except before the first one)
             if i > 1:
@@ -772,6 +873,474 @@ First think deeply and mentally mind map this project deeply across all facets t
         safe_print(f"{Colors.RED}Error generating research questions: {str(e)}{Colors.RESET}")
         return []
 
+def load_project_tracking():
+    """
+    Load the project tracking data from JSON file.
+    If file doesn't exist, create a new one with default structure.
+    
+    Returns:
+        dict: The project tracking data
+    """
+    if os.path.exists(RESEARCH_PROJECTS_FILE):
+        try:
+            with open(RESEARCH_PROJECTS_FILE, "r") as f:
+                data = json.load(f)
+                return data
+        except Exception as e:
+            safe_print(f"{Colors.YELLOW}Warning: Could not load project tracking file: {str(e)}{Colors.RESET}")
+            
+    # Create new tracking file with default structure
+    data = {
+        "version": "1.0",
+        "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "projects": []
+    }
+    
+    # Save the new file
+    try:
+        with open(RESEARCH_PROJECTS_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        safe_print(f"{Colors.YELLOW}Warning: Could not create project tracking file: {str(e)}{Colors.RESET}")
+    
+    return data
+
+def save_project_tracking(data):
+    """
+    Save the project tracking data to JSON file.
+    
+    Args:
+        data (dict): The project tracking data to save
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    # Update the last_updated timestamp
+    data["last_updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    
+    try:
+        with open(RESEARCH_PROJECTS_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception as e:
+        safe_print(f"{Colors.YELLOW}Warning: Could not save project tracking file: {str(e)}{Colors.RESET}")
+        return False
+
+def add_project_to_tracking(project_data):
+    """
+    Add a new project to the tracking file.
+    
+    Args:
+        project_data (dict): Data about the research project
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        # Load existing tracking data
+        tracking_data = load_project_tracking()
+        
+        # Add the new project
+        tracking_data["projects"].append(project_data)
+        
+        # Save the updated tracking data
+        return save_project_tracking(tracking_data)
+    except Exception as e:
+        safe_print(f"{Colors.YELLOW}Warning: Could not add project to tracking file: {str(e)}{Colors.RESET}")
+        return False
+
+def update_project_in_tracking(project_id, updates):
+    """
+    Update an existing project in the tracking file.
+    
+    Args:
+        project_id (str): The ID of the project to update
+        updates (dict): The data to update
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        # Load existing tracking data
+        tracking_data = load_project_tracking()
+        
+        # Find the project by ID
+        for project in tracking_data["projects"]:
+            if project.get("id") == project_id:
+                # Update the project data
+                project.update(updates)
+                # Save the updated tracking data
+                return save_project_tracking(tracking_data)
+        
+        safe_print(f"{Colors.YELLOW}Warning: Project with ID {project_id} not found in tracking file{Colors.RESET}")
+        return False
+    except Exception as e:
+        safe_print(f"{Colors.YELLOW}Warning: Could not update project in tracking file: {str(e)}{Colors.RESET}")
+        return False
+
+def create_openai_client():
+    """
+    Create an OpenAI client instance if OpenAI is available.
+    
+    Returns:
+        OpenAI client or None if not available
+    """
+    if not OPENAI_AVAILABLE:
+        safe_print(f"{Colors.YELLOW}OpenAI integration is not available: OpenAI package not installed{Colors.RESET}")
+        return None
+        
+    if not OPENAI_API_KEY:
+        safe_print(f"{Colors.YELLOW}OpenAI integration is not available: OPENAI_API_KEY not set in environment{Colors.RESET}")
+        return None
+        
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        return client
+    except Exception as e:
+        safe_print(f"{Colors.RED}Error creating OpenAI client: {str(e)}{Colors.RESET}")
+        return None
+
+def upload_file_to_openai(client, file_path, prefix=""):
+    """
+    Upload a file to OpenAI's API.
+    
+    Args:
+        client: The OpenAI client
+        file_path: Path to the file to upload
+        prefix: Prefix for log messages
+        
+    Returns:
+        The file ID or None if failed
+    """
+    try:
+        safe_print(f"{Colors.CYAN}{prefix} Uploading file: {file_path}{Colors.RESET}")
+        
+        with open(file_path, "rb") as file_content:
+            result = client.files.create(
+                file=file_content,
+                purpose="assistants"
+            )
+            
+        safe_print(f"{Colors.GREEN}{prefix} Successfully uploaded file: {file_path}, File ID: {result.id}{Colors.RESET}")
+        return result.id
+    except Exception as e:
+        safe_print(f"{Colors.RED}{prefix} Error uploading file {file_path}: {str(e)}{Colors.RESET}")
+        return None
+
+def upload_files_to_openai(client, project_folder, project_id, prefix=""):
+    """
+    Upload multiple files from a project folder to OpenAI.
+    
+    Args:
+        client: The OpenAI client
+        project_folder: The folder containing the research project
+        project_id: The ID of the project for tracking
+        prefix: Prefix for log messages
+        
+    Returns:
+        Dictionary with uploaded file IDs
+    """
+    if not client:
+        return None
+        
+    try:
+        file_ids = {
+            "readme": None,
+            "markdown_files": [],
+            "summary_files": []
+        }
+        
+        # Upload README.md if it exists
+        readme_path = os.path.join(project_folder, "README.md")
+        if os.path.exists(readme_path):
+            file_id = upload_file_to_openai(client, readme_path, prefix)
+            if file_id:
+                file_ids["readme"] = file_id
+        
+        # Upload markdown files
+        markdown_folder = os.path.join(project_folder, "markdown")
+        if os.path.exists(markdown_folder):
+            for filename in os.listdir(markdown_folder):
+                if filename.endswith(".md"):
+                    file_path = os.path.join(markdown_folder, filename)
+                    file_id = upload_file_to_openai(client, file_path, prefix)
+                    if file_id:
+                        file_ids["markdown_files"].append(file_id)
+        
+        # Upload summary files
+        summaries_folder = os.path.join(project_folder, "summaries")
+        if os.path.exists(summaries_folder):
+            for filename in os.listdir(summaries_folder):
+                if filename.endswith(".md"):
+                    file_path = os.path.join(summaries_folder, filename)
+                    file_id = upload_file_to_openai(client, file_path, prefix)
+                    if file_id:
+                        file_ids["summary_files"].append(file_id)
+        
+        # Update project tracking with file IDs
+        update_data = {
+            "openai_integration": {
+                "file_ids": file_ids
+            }
+        }
+        update_project_in_tracking(project_id, update_data)
+        
+        return file_ids
+    except Exception as e:
+        safe_print(f"{Colors.RED}{prefix} Error uploading files: {str(e)}{Colors.RESET}")
+        return None
+
+def create_vector_store(client, name, prefix=""):
+    """
+    Create a vector store with OpenAI.
+    
+    Args:
+        client: The OpenAI client
+        name: Name for the vector store
+        prefix: Prefix for log messages
+        
+    Returns:
+        The vector store object or None if failed
+    """
+    if not client:
+        return None
+        
+    try:
+        safe_print(f"{Colors.CYAN}{prefix} Creating vector store: {name}{Colors.RESET}")
+        vector_store = client.vector_stores.create(name=name)
+        safe_print(f"{Colors.GREEN}{prefix} Vector store created with ID: {vector_store.id}{Colors.RESET}")
+        return vector_store
+    except Exception as e:
+        safe_print(f"{Colors.RED}{prefix} Error creating vector store: {str(e)}{Colors.RESET}")
+        return None
+
+def add_files_to_vector_store(client, vector_store_id, file_ids, prefix=""):
+    """
+    Add multiple files to a vector store.
+    
+    Args:
+        client: The OpenAI client
+        vector_store_id: ID of the vector store
+        file_ids: List of file IDs to add
+        prefix: Prefix for log messages
+        
+    Returns:
+        Number of files successfully added
+    """
+    if not client or not vector_store_id or not file_ids:
+        return 0
+        
+    added_count = 0
+    
+    for file_id in file_ids:
+        try:
+            client.vector_stores.files.create(
+                vector_store_id=vector_store_id,
+                file_id=file_id
+            )
+            safe_print(f"{Colors.GREEN}{prefix} Added file {file_id} to vector store{Colors.RESET}")
+            added_count += 1
+        except Exception as e:
+            safe_print(f"{Colors.RED}{prefix} Error adding file {file_id} to vector store: {str(e)}{Colors.RESET}")
+    
+    return added_count
+
+def check_files_processing_status(client, vector_store_id, prefix=""):
+    """
+    Check the processing status of files in a vector store.
+    
+    Args:
+        client: The OpenAI client
+        vector_store_id: ID of the vector store
+        prefix: Prefix for log messages
+        
+    Returns:
+        True if all files are processed, False otherwise
+    """
+    if not client or not vector_store_id:
+        return False
+        
+    try:
+        result = client.vector_stores.files.list(vector_store_id=vector_store_id)
+        
+        all_completed = True
+        processed_count = 0
+        
+        for file in result.data:
+            if file.status == "completed":
+                processed_count += 1
+            else:
+                all_completed = False
+                
+        total_files = len(result.data)
+        safe_print(f"{Colors.CYAN}{prefix} Processing status: {processed_count}/{total_files} files completed{Colors.RESET}")
+        
+        return all_completed
+    except Exception as e:
+        safe_print(f"{Colors.RED}{prefix} Error checking file status: {str(e)}{Colors.RESET}")
+        return False
+
+def process_files_with_openai(master_folder, project_data):
+    """
+    Process research files with OpenAI: upload files, create vector store, and update tracking.
+    
+    Args:
+        master_folder: Folder containing the research project
+        project_data: Project data dictionary
+        
+    Returns:
+        Updated project data with OpenAI integration info
+    """
+    if not ENABLE_OPENAI_INTEGRATION:
+        safe_print(f"{Colors.YELLOW}OpenAI integration is disabled. Set ENABLE_OPENAI_INTEGRATION=true to enable.{Colors.RESET}")
+        project_data["openai_integration"] = {"status": "disabled"}
+        return project_data
+        
+    if not OPENAI_AVAILABLE:
+        safe_print(f"{Colors.YELLOW}OpenAI package is not installed. Run 'pip install openai' to enable this feature.{Colors.RESET}")
+        project_data["openai_integration"] = {"status": "unavailable", "reason": "openai package not installed"}
+        return project_data
+        
+    if not OPENAI_API_KEY:
+        safe_print(f"{Colors.YELLOW}OPENAI_API_KEY is not set in environment. Add it to your .env file.{Colors.RESET}")
+        project_data["openai_integration"] = {"status": "unavailable", "reason": "api key not configured"}
+        return project_data
+        
+    # Create OpenAI client
+    client = create_openai_client()
+    if not client:
+        safe_print(f"{Colors.RED}Failed to create OpenAI client. OpenAI integration will be skipped.{Colors.RESET}")
+        project_data["openai_integration"] = {"status": "error", "reason": "client creation failed"}
+        return project_data
+    
+    prefix = "[OpenAI]"
+    safe_print(f"\n{Colors.BOLD}{Colors.CYAN}======== PHASE 5: OPENAI FILE PROCESSING ========{Colors.RESET}")
+    
+    # Get project ID
+    project_id = project_data.get("id")
+    if not project_id:
+        safe_print(f"{Colors.RED}{prefix} Project ID not found in project data. OpenAI integration will be skipped.{Colors.RESET}")
+        project_data["openai_integration"] = {"status": "error", "reason": "project id missing"}
+        return project_data
+    
+    # Step 1: Upload files to OpenAI
+    safe_print(f"{Colors.CYAN}{prefix} Uploading files to OpenAI...{Colors.RESET}")
+    file_ids = upload_files_to_openai(client, master_folder, project_id, prefix)
+    
+    if not file_ids:
+        safe_print(f"{Colors.RED}{prefix} Failed to upload files to OpenAI.{Colors.RESET}")
+        project_data["openai_integration"] = {"status": "error", "reason": "file upload failed"}
+        return project_data
+    
+    # Count total uploaded files
+    total_files = (1 if file_ids["readme"] else 0) + len(file_ids["markdown_files"]) + len(file_ids["summary_files"])
+    safe_print(f"{Colors.GREEN}{prefix} Successfully uploaded {total_files} files to OpenAI.{Colors.RESET}")
+    
+    # If no files were uploaded, skip vector store creation
+    if total_files == 0:
+        safe_print(f"{Colors.YELLOW}{prefix} No files were uploaded. Skipping vector store creation.{Colors.RESET}")
+        project_data["openai_integration"] = {"status": "no_files", "file_ids": file_ids}
+        return project_data
+    
+    # Step 2: Create vector store
+    # Generate a name for the vector store based on topic or questions
+    if project_data.get("parameters", {}).get("topic"):
+        topic = project_data["parameters"]["topic"]
+    else:
+        # Use first question as topic (truncated)
+        first_question = project_data.get("parameters", {}).get("questions", ["Research"])[0]
+        topic = first_question[:30].replace("?", "").strip()
+    
+    timestamp = project_data.get("timestamp", "").replace(":", "").replace("-", "").replace("T", "_").replace("Z", "")
+    vector_store_name = f"{topic}_{timestamp}".replace(" ", "_")[:50]
+    
+    safe_print(f"{Colors.CYAN}{prefix} Creating vector store: {vector_store_name}{Colors.RESET}")
+    vector_store = create_vector_store(client, vector_store_name, prefix)
+    
+    if not vector_store:
+        safe_print(f"{Colors.RED}{prefix} Failed to create vector store.{Colors.RESET}")
+        project_data["openai_integration"] = {
+            "status": "partial",
+            "file_ids": file_ids,
+            "reason": "vector store creation failed"
+        }
+        return project_data
+    
+    # Step 3: Add files to vector store
+    safe_print(f"{Colors.CYAN}{prefix} Adding files to vector store...{Colors.RESET}")
+    
+    # Collect all file IDs
+    all_file_ids = []
+    if file_ids["readme"]:
+        all_file_ids.append(file_ids["readme"])
+    all_file_ids.extend(file_ids["markdown_files"])
+    all_file_ids.extend(file_ids["summary_files"])
+    
+    added_count = add_files_to_vector_store(client, vector_store.id, all_file_ids, prefix)
+    safe_print(f"{Colors.GREEN}{prefix} Added {added_count} files to vector store.{Colors.RESET}")
+    
+    if added_count == 0:
+        safe_print(f"{Colors.RED}{prefix} Failed to add any files to vector store.{Colors.RESET}")
+        project_data["openai_integration"] = {
+            "status": "partial",
+            "file_ids": file_ids,
+            "vector_store": {
+                "id": vector_store.id,
+                "name": vector_store_name,
+                "file_count": 0
+            },
+            "reason": "no files added to vector store"
+        }
+        return project_data
+    
+    # Step 4: Wait for files to be processed
+    safe_print(f"{Colors.CYAN}{prefix} Waiting for files to be processed...{Colors.RESET}")
+    all_completed = False
+    max_checks = OPENAI_PROCESSING_MAX_CHECKS
+    check_interval = OPENAI_PROCESSING_CHECK_INTERVAL
+    check_count = 0
+    
+    while not all_completed and check_count < max_checks:
+        check_count += 1
+        all_completed = check_files_processing_status(client, vector_store.id, prefix)
+        
+        if not all_completed:
+            safe_print(f"{Colors.CYAN}{prefix} Files still processing. Checking again in {check_interval} seconds... (Check {check_count}/{max_checks}){Colors.RESET}")
+            time.sleep(check_interval)
+    
+    # Update project tracking with vector store info
+    vector_store_info = {
+        "id": vector_store.id,
+        "name": vector_store_name,
+        "file_count": added_count,
+        "processing_completed": all_completed
+    }
+    
+    update_data = {
+        "openai_integration": {
+            "status": "success",
+            "file_ids": file_ids,
+            "vector_store": vector_store_info
+        }
+    }
+    
+    # Update the project with this info
+    update_project_in_tracking(project_id, update_data)
+    
+    # Add the vector store info to the project data
+    project_data["openai_integration"] = {
+        "status": "success",
+        "file_ids": file_ids,
+        "vector_store": vector_store_info
+    }
+    
+    if all_completed:
+        safe_print(f"{Colors.BOLD}{Colors.GREEN}{prefix} All files have been processed successfully!{Colors.RESET}")
+    else:
+        safe_print(f"{Colors.YELLOW}{prefix} Some files are still not processed after maximum wait time. You can check status later.{Colors.RESET}")
+    
+    return project_data
+
 def main():
     """
     Main entry point for the research orchestrator.
@@ -779,12 +1348,18 @@ def main():
     1. Process all research questions to get initial responses
     2. Extract and deduplicate citations from all responses
     3. Process each unique citation once
+    4. Consolidate outputs and generate summaries
+    5. (Optional) Process files with OpenAI for vector search
     
     Supports three modes:
     - Direct question mode: Provide questions directly via command line or file
     - Topic mode: Generate questions based on a topic, perspective, and depth
     - Interactive mode: Prompt for topic, perspective, and depth when run without arguments
     """
+    # Create a unique ID for this research project right at the beginning
+    # to ensure it's always available regardless of code path
+    project_id = str(uuid.uuid4())
+    
     parser = argparse.ArgumentParser(description="Research orchestrator for multiple questions.")
     
     # Create a mutually exclusive group for the two explicit modes
@@ -803,7 +1378,15 @@ def main():
     parser.add_argument("--max-workers", "-w", type=int, default=None, help="Maximum number of worker threads (default: automatic based on number of questions)")
     parser.add_argument("--stagger-delay", "-s", type=float, default=None, help="Seconds to wait before starting each new thread (default: from .env)")
     parser.add_argument("--max-citations", "-c", type=int, default=MAX_CITATIONS, help=f"Maximum number of citations to process (default: {MAX_CITATIONS} from .env)")
+    
+    # OpenAI integration args
+    parser.add_argument("--openai-integration", "-ai", choices=["enable", "disable"], help="Enable or disable OpenAI file processing (default: from .env)")
     args = parser.parse_args()
+    
+    # Override OpenAI integration setting from command line if provided
+    if args.openai_integration:
+        global ENABLE_OPENAI_INTEGRATION
+        ENABLE_OPENAI_INTEGRATION = args.openai_integration == "enable"
     
     # Determine which mode we're operating in
     questions = []
@@ -824,7 +1407,21 @@ def main():
         questions = generate_research_questions(args.topic, args.perspective, args.depth)
         if not questions:
             safe_print(f"{Colors.RED}Failed to generate questions for topic. Exiting.{Colors.RESET}")
-            return
+            # Create an empty project tracking entry with failure status
+            project_data = {
+                "id": project_id,
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "parameters": {
+                    "topic": args.topic,
+                    "perspective": args.perspective,
+                    "depth": args.depth,
+                    "questions": []
+                },
+                "status": "failed",
+                "reason": "Failed to generate questions for topic"
+            }
+            add_project_to_tracking(project_data)
+            return project_data
         
         # Limit to the requested depth (in case API returned more)
         questions = questions[:args.depth]
@@ -886,20 +1483,51 @@ def main():
         questions = generate_research_questions(topic, perspective, depth)
         if not questions:
             safe_print(f"{Colors.RED}Failed to generate questions for topic. Exiting.{Colors.RESET}")
-            return
-        
-        # Save the values to args for later use
-        args.topic = topic
-        args.perspective = perspective
-        args.depth = depth
+            # Create an empty project tracking entry with failure status
+            project_data = {
+                "id": project_id,
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "parameters": {
+                    "topic": topic,
+                    "perspective": perspective,
+                    "depth": depth,
+                    "questions": []
+                },
+                "status": "failed",
+                "reason": "Failed to generate questions for topic"
+            }
+            add_project_to_tracking(project_data)
+            return project_data
         
         # Limit to the requested depth (in case API returned more)
         questions = questions[:depth]
         safe_print(f"{Colors.BOLD}{Colors.GREEN}Generated {len(questions)} questions for topic{Colors.RESET}")
         
+        # Save the values to args for later use
+        args.topic = topic
+        args.perspective = perspective
+        args.depth = depth
+
     if not questions:
         safe_print(f"{Colors.RED}No research questions provided. Exiting.{Colors.RESET}")
-        return
+        # Create an empty project tracking entry with failure status
+        project_data = {
+            "id": project_id,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "parameters": {
+                "questions": []
+            },
+            "status": "failed",
+            "reason": "No research questions provided"
+        }
+        # Add topic, perspective, and depth if available
+        if args.topic:
+            project_data["parameters"]["topic"] = args.topic
+            project_data["parameters"]["perspective"] = args.perspective
+            project_data["parameters"]["depth"] = args.depth
+        
+        add_project_to_tracking(project_data)
+        return project_data
 
     # Load the rate limit settings
     RATE_LIMIT_QUESTIONS_PER_WORKER = int(os.getenv('RATE_LIMIT_QUESTIONS_PER_WORKER', 10))
@@ -934,26 +1562,66 @@ def main():
     os.makedirs(os.path.join(master_folder, "summaries"), exist_ok=True)  # Added new summaries directory
     
     # Create a README for the project
-    if args.topic:
-        readme_path = os.path.join(master_folder, "README.md")
-        with open(readme_path, "w", encoding="utf-8") as f:
-            f.write(f"# Research Project: {args.topic}\n\n")
-            f.write(f"**Generated on**: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}\n\n")
+    readme_path = os.path.join(master_folder, "README.md")
+    topic_title = args.topic if args.topic else "Research Project"
+
+    with open(readme_path, "w", encoding="utf-8") as f:
+        f.write(f"# {topic_title}\n\n")
+        f.write(f"**Generated on**: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}\n\n")
+        f.write(f"**Project ID**: {project_id}\n\n")
+
+        if args.topic:
             f.write(f"**Topic**: {args.topic}\n\n")
             f.write(f"**Perspective**: {args.perspective}\n\n")
-            f.write("## Folder Structure\n\n")
-            f.write("- `markdown/`: Formatted markdown files for each research question\n")
-            f.write("- `response/`: Raw API responses\n")
-            f.write("- `summaries/`: Consolidated files and indexes\n\n")
-            f.write("## Research Questions\n\n")
-            for i, q in enumerate(questions, 1):
-                f.write(f"{i}. {q}\n")
+        
+        f.write("## Folder Structure\n\n")
+        f.write("- `markdown/`: Formatted markdown files for each research question\n")
+        f.write("- `response/`: Raw API responses\n")
+        f.write("- `summaries/`: Consolidated files and indexes\n\n")
+        
+        # Add OpenAI integration info if enabled
+        if ENABLE_OPENAI_INTEGRATION:
+            f.write("## OpenAI Integration\n\n")
+            f.write("This research project has been integrated with OpenAI's file search capabilities:\n\n")
+            f.write("- Research files have been uploaded to OpenAI\n")
+            f.write("- A vector store has been created for semantic search\n")
+            f.write("- Project tracking information is stored in the research_projects.json file\n\n")
+            f.write("Use the project ID above when using the OpenAI search functionality.\n\n")
+        
+        f.write("## Research Questions\n\n")
+        for i, q in enumerate(questions, 1):
+            f.write(f"{i}. {q}\n")
     
     safe_print(f"{Colors.BOLD}{Colors.GREEN}Research orchestrator started at {time.strftime('%Y-%m-%d %H:%M:%S')}{Colors.RESET}")
     safe_print(f"{Colors.MAGENTA}Processing {len(questions)} questions with a maximum of {max_workers} worker threads{Colors.RESET}")
     safe_print(f"{Colors.MAGENTA}Thread stagger delay: {THREAD_STAGGER_DELAY} seconds{Colors.RESET}")
     safe_print(f"{Colors.MAGENTA}Max citations to process: {args.max_citations} (prioritizing most referenced ones){Colors.RESET}")
     safe_print(f"{Colors.MAGENTA}Output directory: {master_folder}{Colors.RESET}")
+    
+    # Create a project data structure for tracking
+    project_data = {
+        "id": project_id,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "parameters": {
+            "questions": questions
+        },
+        "local_storage": {
+            "folder": os.path.abspath(master_folder),
+            "markdown_folder": "markdown",
+            "summary_folder": "summaries",
+            "response_folder": "response"
+        },
+        "status": "in_progress"
+    }
+    
+    # Add topic, perspective, and depth if available
+    if args.topic:
+        project_data["parameters"]["topic"] = args.topic
+        project_data["parameters"]["perspective"] = args.perspective
+        project_data["parameters"]["depth"] = args.depth
+    
+    # Add project to tracking file
+    add_project_to_tracking(project_data)
     
     ########## PHASE 1: Process all questions ##########
     safe_print(f"\n{Colors.BOLD}{Colors.CYAN}======== PHASE 1: PROCESSING ALL QUESTIONS ========{Colors.RESET}")
@@ -968,7 +1636,12 @@ def main():
             if i > 1 and THREAD_STAGGER_DELAY > 0:
                 time.sleep(THREAD_STAGGER_DELAY)
                 
-            future = executor.submit(research_pipeline, question, master_folder, i, len(questions))
+            # Pass topic and perspective if available
+            if args.topic:
+                future = executor.submit(research_pipeline, question, master_folder, i, len(questions), args.topic, args.perspective)
+            else:
+                future = executor.submit(research_pipeline, question, master_folder, i, len(questions))
+                
             futures.append(future)
             
         # Collect results as they complete
@@ -1007,7 +1680,7 @@ def main():
         consolidate_summary_files(master_folder, "executive_summary", "consolidated_executive_summaries.md", "Consolidated Executive Summaries")
         consolidate_summary_files(master_folder, "research_summary", "consolidated_research_summaries.md", "Consolidated Research Summaries")
         move_file(master_index_path, os.path.join(master_folder, "summaries"))
-        return
+        return project_data
         
     ########## PHASE 3: Process each unique citation ##########
     safe_print(f"\n{Colors.BOLD}{Colors.CYAN}======== PHASE 3: PROCESSING UNIQUE CITATIONS ========{Colors.RESET}")
@@ -1089,6 +1762,11 @@ def main():
             f.write("- `master_index.md`: Index of all questions and their research outputs\n")
             f.write("- `citation_index.md`: Index of all citations and their references\n")
     
+    ########## PHASE 5: OpenAI File Processing (Optional) ##########
+    # Only run if OpenAI integration is enabled
+    if ENABLE_OPENAI_INTEGRATION:
+        project_data = process_files_with_openai(master_folder, project_data)
+    
     # Output summary
     safe_print(f"\n{Colors.BOLD}{Colors.GREEN}Research complete at {time.strftime('%Y-%m-%d %H:%M:%S')}{Colors.RESET}")
     safe_print(f"{Colors.CYAN}Summary:{Colors.RESET}")
@@ -1101,6 +1779,22 @@ def main():
     safe_print(f"{Colors.CYAN}- Consolidated Files: Executive summaries, research summaries{Colors.RESET}")
     safe_print(f"{Colors.CYAN}- Output directory: {master_folder}{Colors.RESET}")
     safe_print(f"{Colors.CYAN}- Summaries directory: {os.path.join(master_folder, 'summaries')}{Colors.RESET}")
+    
+    # Add OpenAI info to the summary if it was processed
+    if project_data.get("openai_integration"):
+        vs_info = project_data["openai_integration"].get("vector_store", {})
+        file_ids = project_data["openai_integration"].get("file_ids", {})
+        
+        total_files = (1 if file_ids.get("readme") else 0) + len(file_ids.get("markdown_files", [])) + len(file_ids.get("summary_files", []))
+        
+        safe_print(f"{Colors.CYAN}- OpenAI Integration: {total_files} files uploaded{Colors.RESET}")
+        safe_print(f"{Colors.CYAN}- Vector Store: {vs_info.get('name')} (ID: {vs_info.get('id')}){Colors.RESET}")
+    
+    # Update project status to completed
+    project_data["status"] = "completed"
+    update_project_in_tracking(project_id, {"status": "completed"})
+    
+    return project_data
 
 if __name__ == "__main__":
     main() 
